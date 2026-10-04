@@ -16,10 +16,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'  # 👈 Node.js 22 में Built-in WebSocket सपोर्ट होता है
 
-      - name: Install Supabase JS
-        run: npm install @supabase/supabase-js
+      - name: Install Dependencies
+        run: npm install @supabase/supabase-js ws
 
       - name: Run Fetch Script
         env:
