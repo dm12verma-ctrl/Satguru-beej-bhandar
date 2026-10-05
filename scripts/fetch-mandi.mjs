@@ -1,6 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
 
-// सिर्फ इंग्लिश से हिंदी नाम बदलने के लिए (इनमें कोई भाव नहीं है)
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
   "Sri Ganganagar": "श्रीगंगानगर", "Sriganganagar": "श्रीगंगानगर", "Churu": "चूरू", "Sangaria": "संगरिया",
@@ -43,7 +42,7 @@ async function runAutoSync() {
   const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DATA_GOV_API_KEY) {
-    console.error("❌ Secrets Missing!");
+    console.error("❌ Secrets Missing in Environment!");
     process.exit(1);
   }
 
@@ -51,31 +50,65 @@ async function runAutoSync() {
     auth: { persistSession: false }
   });
 
-  const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${DATA_GOV_API_KEY}&format=json&limit=2000&filters[state]=Rajasthan`;
+  // Properly encode filters parameter to avoid Node 22 URL parsing crash
+  const params = new URLSearchParams({
+    "api-key": DATA_GOV_API_KEY,
+    "format": "json",
+    "limit": "2000",
+    "filters[state]": "Rajasthan"
+  });
+
+  const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?${params.toString()}`;
 
   try {
-    console.log("📡 Fetching from data.gov.in...");
-    const res = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    console.log("📡 Fetching from data.gov.in API...");
+    let response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+      }
     });
 
-    if (!res.ok) {
-      throw new Error(`Govt API HTTP Error: ${res.status}`);
+    if (!response.ok) {
+      throw new Error(`Govt API HTTP Error: ${response.status} ${response.statusText}`);
     }
 
-    const data = await res.json();
+    let data = await response.json();
+    let records = data?.records || [];
 
-    // अगर API खाली डेटा दे तो कुछ भी सेव मत करो
-    if (!data || !data.records || data.records.length === 0) {
-      console.log("⚠️ Govt API returned 0 records today. No changes made to database.");
-      process.exit(0);
+    // Fallback search if filtered query returns empty
+    if (records.length === 0) {
+      console.log("⚠️ Filtered query returned 0, trying general query...");
+      const fallbackParams = new URLSearchParams({
+        "api-key": DATA_GOV_API_KEY,
+        "format": "json",
+        "limit": "2000"
+      });
+      const fallbackUrl = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?${fallbackParams.toString()}`;
+      
+      response = await fetch(fallbackUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept": "application/json"
+        }
+      });
+      
+      if (response.ok) {
+        data = await response.json();
+        const allRecs = data?.records || [];
+        records = allRecs.filter(r => r.state && r.state.toLowerCase().includes("rajasthan"));
+      }
     }
 
-    console.log(`✅ Got ${data.records.length} REAL records from Govt API!`);
+    if (records.length === 0) {
+      throw new Error("⚠️ Govt API returned 0 records for Rajasthan today.");
+    }
+
+    console.log(`✅ Got ${records.length} real records from Govt API!`);
 
     const todayStr = new Date().toLocaleDateString("hi-IN");
 
-    const rows = data.records
+    const rows = records
       .map((r) => {
         const minP = Number(r.min_price) || 0;
         const maxP = Number(r.max_price) || 0;
@@ -98,26 +131,18 @@ async function runAutoSync() {
       })
       .filter(Boolean);
 
-    if (rows.length === 0) {
-      console.log("⚠️ All records were empty/zero. Nothing inserted.");
-      process.exit(0);
-    }
-
     console.log(`🧹 Clearing old API records from Supabase...`);
     await supabase.from("mandi_rates").delete().eq("source", "api");
 
-    console.log(`💾 Inserting ${rows.length} REAL government mandi records...`);
+    console.log(`💾 Inserting ${rows.length} real government mandi records into Supabase...`);
     const { error } = await supabase.from("mandi_rates").insert(rows);
 
-    if (error) {
-      console.error("❌ Supabase Insert Error:", error.message);
-      process.exit(1);
-    }
+    if (error) throw error;
 
     console.log("🎉 SUCCESS! Real Mandi Rates Updated Successfully!");
   } catch (err) {
     console.error("❌ Sync Error:", err.message);
-    process.exit(0);
+    process.exit(1); // Fail workflow if fetch fails so you see exact error in GH Actions
   }
 }
 
