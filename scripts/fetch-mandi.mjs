@@ -1,3 +1,8 @@
+import dns from "node:dns";
+
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
 import { createClient } from "@supabase/supabase-js";
 
 const MANDI_HINDI = {
