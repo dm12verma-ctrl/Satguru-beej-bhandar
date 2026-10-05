@@ -2,13 +2,14 @@ name: Daily Govt Mandi Bhav Sync
 
 on:
   schedule:
-    # भारत समय अनुसार सुबह 7:00 बजे अपने-आप चलेगा
-    - cron: '30 1 * * *'
-  workflow_dispatch: # मैन्युअली चलाने के लिए
+    # भारत समय अनुसार सुबह 7:00 बजे (UTC 01:30) अपने-आप चलेगा
+    - cron: "30 1 * * *"
+  workflow_dispatch: {}
 
 jobs:
   sync-mandi:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -16,14 +17,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'  # 👈 Node.js 22 में Built-in WebSocket सपोर्ट होता है
+          node-version: "22"
 
       - name: Install Dependencies
-        run: npm install @supabase/supabase-js ws
+        run: npm install @supabase/supabase-js
 
       - name: Run Fetch Script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
+          DATA_GOV_RESOURCE_ID: ${{ secrets.DATA_GOV_RESOURCE_ID }}
         run: node scripts/fetch-mandi.mjs
