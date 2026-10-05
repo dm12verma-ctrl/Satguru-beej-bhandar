@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 
+// ── English -> Hindi Translation Mappings ──
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
   "Sri Ganganagar": "श्रीगंगानगर", "Sriganganagar": "श्रीगंगानगर", "Churu": "चूरू", "Sangaria": "संगरिया",
@@ -25,53 +26,120 @@ const DISTRICT_HINDI = {
   "Udaipur": "उदयपुर", "Tonk": "टोंक", "Sawai Madhopur": "सवाई माधोपुर"
 };
 
-const CROP_HINDI = {
-  "Wheat": "गेहूं", "Mustard": "सरसों", "Guar": "ग्वार", "Guar Seed(Cluster Beans Seed)": "ग्वार",
-  "Bajra(Pearl Millet/Cumbu)": "बाजरा", "Bajra": "बाजरा", "Green Gram (Moong)(Whole)": "मूंग",
-  "Moath Dal": "मोठ", "Gram": "चना", "Groundnut": "मूंगफली", "Cotton": "कपास",
-  "Cummin Seed(Jeera)": "जीरा", "Isabgol": "इसबगोल", "Barley (Jau)": "जौ", "Maize": "मक्का",
-  "Soyabean": "सोयाबीन", "Paddy(Dhan)(Common)": "धान", "Coriander(Leaves)": "धनिया", "Coriander": "धनिया",
-  "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
-};
+// Major Rajasthan Crops to fetch from Agmarknet Live Govt Feed
+const TARGET_CROPS = [
+  { en: "Mustard", hi: "सरसों" },
+  { en: "Wheat", hi: "गेहूं" },
+  { en: "Guar", hi: "ग्वार" },
+  { en: "Gram", hi: "चना" },
+  { en: "Bajra", hi: "बाजरा" },
+  { en: "Cotton", hi: "कपास" },
+  { en: "Green Gram", hi: "मूंग" },
+  { en: "Groundnut", hi: "मूंगफली" },
+  { en: "Soyabean", hi: "सोयाबीन" },
+  { en: "Cumin", hi: "जीरा" },
+  { en: "Barley", hi: "जौ" },
+  { en: "Paddy", hi: "धान" }
+];
 
-async function fetchGovtDataViaProxy(apiKey) {
-  const targetUrl = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${apiKey}&format=json&limit=2000`;
-  
-  const proxies = [
-    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
-  ];
+async function fetchAgmarknetGovtData() {
+  const allRows = [];
+  const todayStr = new Date().toLocaleDateString("hi-IN");
 
-  for (const proxyUrl of proxies) {
+  for (const crop of TARGET_CROPS) {
     try {
-      const hostname = new URL(proxyUrl).hostname;
-      console.log(`📡 Requesting Govt API via Proxy: ${hostname}...`);
-      const res = await fetch(proxyUrl, { headers: { "Accept": "application/json" } });
-      if (res.ok) {
-        const data = await res.json();
-        const records = data?.records || (typeof data === "string" ? JSON.parse(data)?.records : null);
-        if (records && records.length > 0) {
-          console.log(`✅ Successfully fetched ${records.length} records via ${hostname}!`);
-          return records;
+      const rssUrl = `https://agmarknet.gov.in/RssFeed/RssFeed_Commoditywise.aspx?com=${encodeURIComponent(crop.en)}`;
+      console.log(`📡 Fetching Agmarknet Live Govt Feed for: ${crop.hi} (${crop.en})...`);
+
+      const res = await fetch(rssUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
+      });
+
+      if (!res.ok) {
+        console.warn(`⚠️ HTTP ${res.status} for crop: ${crop.en}`);
+        continue;
+      }
+
+      const xmlText = await res.text();
+      const items = xmlText.match(/<item>[\s\S]*?<\/item>/gi) || [];
+
+      for (const itemXml of items) {
+        // Only process Rajasthan Mandis
+        if (!itemXml.toLowerCase().includes("rajasthan")) continue;
+
+        const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/i);
+        const descMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/i);
+        const dateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+
+        const text = (titleMatch ? titleMatch[1] : "") + " " + (descMatch ? descMatch[1] : "");
+
+        // Extract Market
+        const mktMatch = text.match(/Market:\s*([^,<\n]+)/i);
+        const mktRaw = mktMatch ? mktMatch[1].trim() : "";
+        if (!mktRaw) continue;
+
+        // Extract District
+        const distMatch = text.match(/District:\s*([^,<\n]+)/i);
+        const distRaw = distMatch ? distMatch[1].trim() : "";
+
+        // Extract Variety
+        const varMatch = text.match(/Variety:\s*([^,<\n]+)/i);
+        const varietyRaw = varMatch ? varMatch[1].trim() : "";
+
+        // Extract Prices
+        const minMatch = text.match(/Min(?:imum)?\s*(?:Price)?:\s*(\d+)/i) || text.match(/Min:\s*(\d+)/i);
+        const maxMatch = text.match(/Max(?:imum)?\s*(?:Price)?:\s*(\d+)/i) || text.match(/Max:\s*(\d+)/i);
+        const modalMatch = text.match(/Modal\s*(?:Price)?:\s*(\d+)/i) || text.match(/Modal:\s*(\d+)/i);
+
+        const minP = minMatch ? Number(minMatch[1]) : 0;
+        const maxP = maxMatch ? Number(maxMatch[1]) : 0;
+        const modalP = modalMatch ? Number(modalMatch[1]) : (maxP || minP);
+
+        if (minP === 0 && maxP === 0 && modalP === 0) continue;
+
+        const marketHi = MANDI_HINDI[mktRaw] || mktRaw;
+        const districtHi = DISTRICT_HINDI[distRaw] || distRaw || "राजस्थान";
+
+        let dateStr = todayStr;
+        if (dateMatch && dateMatch[1]) {
+          const parsed = new Date(dateMatch[1]);
+          if (!isNaN(parsed.getTime())) {
+            dateStr = parsed.toLocaleDateString("hi-IN");
+          }
+        }
+
+        allRows.push({
+          mandi_name: marketHi,
+          district: districtHi,
+          state: "Rajasthan",
+          crop_name: crop.hi,
+          variety: varietyRaw !== "Local" && varietyRaw !== "Other" ? varietyRaw : "",
+          min_price: minP,
+          max_price: maxP,
+          modal_price: modalP,
+          arrival_date: dateStr,
+          source: "api",
+          updated_at: new Date().toISOString()
+        });
       }
     } catch (err) {
-      console.warn(`⚠️ Proxy failed: ${err.message}`);
+      console.warn(`⚠️ Error processing ${crop.en}: ${err.message}`);
     }
   }
-  return null;
+
+  return allRows;
 }
 
 async function runAutoSync() {
-  console.log("🚀 Starting Daily Mandi Sync...");
+  console.log("🚀 Starting Daily Agmarknet Mandi Sync...");
 
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
 
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DATA_GOV_API_KEY) {
-    console.error("❌ Secrets Missing in Environment!");
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.error("❌ Supabase Secrets Missing in Environment!");
     process.exit(1);
   }
 
@@ -79,66 +147,28 @@ async function runAutoSync() {
     auth: { persistSession: false }
   });
 
-  const rawRecords = await fetchGovtDataViaProxy(DATA_GOV_API_KEY);
+  const rows = await fetchAgmarknetGovtData();
 
-  if (!rawRecords || rawRecords.length === 0) {
-    console.error("❌ All proxies and direct connections failed / Govt API is offline.");
-    process.exit(1);
-  }
-
-  // Filter Rajasthan
-  const rajRecords = rawRecords.filter((r) => {
-    const st = String(r.state || r.State || r.state_name || "").toLowerCase();
-    return st.includes("rajasthan") || st.includes("raj");
-  });
-
-  const targetRecords = rajRecords.length > 0 ? rajRecords : rawRecords;
-  const todayStr = new Date().toLocaleDateString("hi-IN");
-
-  const rows = targetRecords
-    .map((r) => {
-      const minP = Number(r.min_price) || 0;
-      const maxP = Number(r.max_price) || 0;
-      const modalP = Number(r.modal_price) || 0;
-      if (minP === 0 && maxP === 0 && modalP === 0) return null;
-
-      const marketRaw = String(r.market || "");
-      const districtRaw = String(r.district || "");
-      const cropRaw = String(r.commodity || "");
-
-      return {
-        mandi_name: MANDI_HINDI[marketRaw] || marketRaw || "अज्ञात",
-        district: DISTRICT_HINDI[districtRaw] || districtRaw || "राजस्थान",
-        state: "Rajasthan",
-        crop_name: CROP_HINDI[cropRaw] || cropRaw || "फसल",
-        variety: String(r.variety || "").trim(),
-        min_price: minP,
-        max_price: maxP,
-        modal_price: modalP,
-        arrival_date: String(r.arrival_date || todayStr),
-        source: "api",
-        updated_at: new Date().toISOString(),
-      };
-    })
-    .filter(Boolean);
+  console.log(`📦 Successfully Extracted ${rows.length} REAL Govt Mandi Records from Agmarknet!`);
 
   if (rows.length === 0) {
-    console.error("❌ 0 valid price rows after parsing.");
+    console.error("❌ 0 records fetched from Agmarknet.");
     process.exit(1);
   }
 
   console.log(`🧹 Clearing old API records from Supabase...`);
-  await supabase.from("mandi_rates").delete().eq("source", "api");
+  const { error: delErr } = await supabase.from("mandi_rates").delete().eq("source", "api");
+  if (delErr) console.warn("Delete Notice:", delErr.message);
 
-  console.log(`💾 Inserting ${rows.length} REAL government mandi records into Supabase...`);
-  const { error } = await supabase.from("mandi_rates").insert(rows);
+  console.log(`💾 Inserting ${rows.length} fresh Agmarknet records into Supabase...`);
+  const { error: insErr } = await supabase.from("mandi_rates").insert(rows);
 
-  if (error) {
-    console.error("❌ Supabase DB Insert Failed:", error.message);
+  if (insErr) {
+    console.error("❌ Supabase Insert Error:", insErr.message);
     process.exit(1);
   }
 
-  console.log(`🎉 SUCCESS! Successfully inserted ${rows.length} Mandi Rates into Supabase!`);
+  console.log(`🎉 SUCCESS! Fully Synced ${rows.length} Live Mandi Rates into Supabase!`);
 }
 
 runAutoSync();
