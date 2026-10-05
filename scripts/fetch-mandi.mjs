@@ -34,61 +34,22 @@ const CROP_HINDI = {
   "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
 };
 
-const BACKUP_RATES = [
-  { mandi_name: "सरदारशहर", district: "चूरू", crop_name: "सरसों", min_price: 5500, max_price: 5900, modal_price: 5720 },
-  { mandi_name: "सरदारशहर", district: "चूरू", crop_name: "ग्वार", min_price: 4950, max_price: 5420, modal_price: 5200 },
-  { mandi_name: "सरदारशहर", district: "चूरू", crop_name: "गेहूं", min_price: 2450, max_price: 2600, modal_price: 2530 },
-  { mandi_name: "सरदारशहर", district: "चूरू", crop_name: "मूंग", min_price: 7700, max_price: 8350, modal_price: 8000 },
-  { mandi_name: "नोहर", district: "हनुमानगढ़", crop_name: "सरसों", min_price: 5550, max_price: 5950, modal_price: 5760 },
-  { mandi_name: "नोहर", district: "हनुमानगढ़", crop_name: "ग्वार", min_price: 5000, max_price: 5480, modal_price: 5250 },
-  { mandi_name: "नोहर", district: "हनुमानगढ़", crop_name: "चना", min_price: 5300, max_price: 5750, modal_price: 5520 },
-  { mandi_name: "रावतसर", district: "हनुमानगढ़", crop_name: "कपास", min_price: 6900, max_price: 7350, modal_price: 7120 },
-  { mandi_name: "हनुमानगढ़", district: "हनुमानगढ़", crop_name: "कपास", min_price: 7000, max_price: 7450, modal_price: 7200 },
-  { mandi_name: "श्रीगंगानगर", district: "श्रीगंगानगर", crop_name: "गेहूं", min_price: 2480, max_price: 2650, modal_price: 2560 },
-  { mandi_name: "बीकानेर", district: "बीकानेर", crop_name: "मूंगफली", min_price: 5600, max_price: 6300, modal_price: 5950 },
-  { mandi_name: "मेड़ता सिटी", district: "नागौर", crop_name: "जीरा", min_price: 28000, max_price: 32500, modal_price: 30200 },
-  { mandi_name: "जयपुर (मुहाना)", district: "जयपुर", crop_name: "सरसों", min_price: 5500, max_price: 5900, modal_price: 5700 },
-  { mandi_name: "कोटा (भामाशाह)", district: "कोटा", crop_name: "सोयाबीन", min_price: 4600, max_price: 5100, modal_price: 4850 }
-];
-
 async function fetchFromGovtWithProxy(targetUrl) {
-  // Method 1: CodeTabs Proxy
   try {
-    console.log("🌐 Trying Proxy 1 (CodeTabs)...");
     const res = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`);
     if (res.ok) {
       const json = await res.json();
       if (json?.records?.length) return json.records;
     }
-  } catch (e) {
-    console.log("⚠️ Proxy 1 failed");
-  }
+  } catch (e) {}
 
-  // Method 2: AllOrigins Proxy
   try {
-    console.log("🌐 Trying Proxy 2 (AllOrigins)...");
     const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`);
     if (res.ok) {
       const json = await res.json();
       if (json?.records?.length) return json.records;
     }
-  } catch (e) {
-    console.log("⚠️ Proxy 2 failed");
-  }
-
-  // Method 3: Direct API
-  try {
-    console.log("🌐 Trying Direct API...");
-    const res = await fetch(targetUrl, {
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-    });
-    if (res.ok) {
-      const json = await res.json();
-      if (json?.records?.length) return json.records;
-    }
-  } catch (e) {
-    console.log("⚠️ Direct API failed");
-  }
+  } catch (e) {}
 
   return null;
 }
@@ -101,7 +62,7 @@ async function runAutoSync() {
   const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DATA_GOV_API_KEY) {
-    console.error("❌ Secrets Missing in Environment!");
+    console.error("❌ Secrets Missing!");
     process.exit(1);
   }
 
@@ -113,58 +74,48 @@ async function runAutoSync() {
 
   try {
     const rawRecords = await fetchFromGovtWithProxy(url);
+
+    if (!rawRecords || rawRecords.length === 0) {
+      console.log("⚠️ Govt API Unreachable or no data today. KEEPING EXISTING DATABASE INTAC.");
+      process.exit(0); // Do NOT overwrite DB with fake data
+    }
+
     const todayStr = new Date().toLocaleDateString("hi-IN");
 
-    let rows = [];
+    const rows = rawRecords
+      .map((r) => {
+        const minP = Number(r.min_price) || 0;
+        const maxP = Number(r.max_price) || 0;
+        const modalP = Number(r.modal_price) || 0;
+        if (minP === 0 && maxP === 0 && modalP === 0) return null;
 
-    if (rawRecords && rawRecords.length > 0) {
-      console.log(`✅ Got ${rawRecords.length} records from Govt API!`);
-      rows = rawRecords
-        .map((r) => {
-          const minP = Number(r.min_price) || 0;
-          const maxP = Number(r.max_price) || 0;
-          const modalP = Number(r.modal_price) || 0;
-          if (minP === 0 && maxP === 0 && modalP === 0) return null;
-
-          return {
-            mandi_name: MANDI_HINDI[r.market] || r.market || "अज्ञात",
-            district: DISTRICT_HINDI[r.district] || r.district || "राजस्थान",
-            state: "Rajasthan",
-            crop_name: CROP_HINDI[r.commodity] || r.commodity || "फसल",
-            variety: (r.variety || "").trim(),
-            min_price: minP,
-            max_price: maxP,
-            modal_price: modalP,
-            arrival_date: r.arrival_date || todayStr,
-            source: "api",
-            updated_at: new Date().toISOString(),
-          };
-        })
-        .filter(Boolean);
-    } else {
-      console.log("⚠️ Govt API Unreachable. Syncing Verified Today Mandi Rates...");
-      rows = BACKUP_RATES.map((item) => ({
-        ...item,
-        state: "Rajasthan",
-        variety: "",
-        arrival_date: todayStr,
-        source: "api",
-        updated_at: new Date().toISOString(),
-      }));
-    }
+        return {
+          mandi_name: MANDI_HINDI[r.market] || r.market || "अज्ञात",
+          district: DISTRICT_HINDI[r.district] || r.district || "राजस्थान",
+          state: "Rajasthan",
+          crop_name: CROP_HINDI[r.commodity] || r.commodity || "फसल",
+          variety: (r.variety || "").trim(),
+          min_price: minP,
+          max_price: maxP,
+          modal_price: modalP,
+          arrival_date: r.arrival_date || todayStr,
+          source: "api",
+          updated_at: new Date().toISOString(),
+        };
+      })
+      .filter(Boolean);
 
     console.log(`🧹 Clearing old API records from Supabase...`);
     await supabase.from("mandi_rates").delete().eq("source", "api");
 
-    console.log(`💾 Inserting ${rows.length} fresh mandi records...`);
+    console.log(`💾 Inserting ${rows.length} REAL government mandi records...`);
     const { error } = await supabase.from("mandi_rates").insert(rows);
 
     if (error) throw error;
 
-    console.log("🎉 SUCCESS! All Mandi Rates Updated Successfully!");
+    console.log("🎉 SUCCESS! Real Mandi Rates Updated!");
   } catch (err) {
     console.error("❌ Sync Warning:", err.message);
-    // Don't crash process, exit gracefully so workflow turns green
     process.exit(0);
   }
 }
