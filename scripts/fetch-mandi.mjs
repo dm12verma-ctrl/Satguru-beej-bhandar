@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 
+// सिर्फ इंग्लिश से हिंदी नाम बदलने के लिए (इनमें कोई भाव नहीं है)
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
   "Sri Ganganagar": "श्रीगंगानगर", "Sriganganagar": "श्रीगंगानगर", "Churu": "चूरू", "Sangaria": "संगरिया",
@@ -34,26 +35,6 @@ const CROP_HINDI = {
   "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
 };
 
-async function fetchFromGovtWithProxy(targetUrl) {
-  try {
-    const res = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`);
-    if (res.ok) {
-      const json = await res.json();
-      if (json?.records?.length) return json.records;
-    }
-  } catch (e) {}
-
-  try {
-    const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`);
-    if (res.ok) {
-      const json = await res.json();
-      if (json?.records?.length) return json.records;
-    }
-  } catch (e) {}
-
-  return null;
-}
-
 async function runAutoSync() {
   console.log("🚀 Starting Daily Mandi Sync...");
 
@@ -73,16 +54,28 @@ async function runAutoSync() {
   const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${DATA_GOV_API_KEY}&format=json&limit=2000&filters[state]=Rajasthan`;
 
   try {
-    const rawRecords = await fetchFromGovtWithProxy(url);
+    console.log("📡 Fetching from data.gov.in...");
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
+    });
 
-    if (!rawRecords || rawRecords.length === 0) {
-      console.log("⚠️ Govt API Unreachable or no data today. KEEPING EXISTING DATABASE INTAC.");
-      process.exit(0); // Do NOT overwrite DB with fake data
+    if (!res.ok) {
+      throw new Error(`Govt API HTTP Error: ${res.status}`);
     }
+
+    const data = await res.json();
+
+    // अगर API खाली डेटा दे तो कुछ भी सेव मत करो
+    if (!data || !data.records || data.records.length === 0) {
+      console.log("⚠️ Govt API returned 0 records today. No changes made to database.");
+      process.exit(0);
+    }
+
+    console.log(`✅ Got ${data.records.length} REAL records from Govt API!`);
 
     const todayStr = new Date().toLocaleDateString("hi-IN");
 
-    const rows = rawRecords
+    const rows = data.records
       .map((r) => {
         const minP = Number(r.min_price) || 0;
         const maxP = Number(r.max_price) || 0;
@@ -105,17 +98,25 @@ async function runAutoSync() {
       })
       .filter(Boolean);
 
+    if (rows.length === 0) {
+      console.log("⚠️ All records were empty/zero. Nothing inserted.");
+      process.exit(0);
+    }
+
     console.log(`🧹 Clearing old API records from Supabase...`);
     await supabase.from("mandi_rates").delete().eq("source", "api");
 
     console.log(`💾 Inserting ${rows.length} REAL government mandi records...`);
     const { error } = await supabase.from("mandi_rates").insert(rows);
 
-    if (error) throw error;
+    if (error) {
+      console.error("❌ Supabase Insert Error:", error.message);
+      process.exit(1);
+    }
 
-    console.log("🎉 SUCCESS! Real Mandi Rates Updated!");
+    console.log("🎉 SUCCESS! Real Mandi Rates Updated Successfully!");
   } catch (err) {
-    console.error("❌ Sync Warning:", err.message);
+    console.error("❌ Sync Error:", err.message);
     process.exit(0);
   }
 }
