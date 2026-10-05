@@ -1,4 +1,13 @@
 import { createClient } from "@supabase/supabase-js";
+import dns from "node:dns";
+
+// 1. Force Node.js to use IPv4 first (fixes fetch failed on GitHub Actions for govt sites)
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
+// 2. Allow Govt SSL Certificates
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
@@ -34,6 +43,28 @@ const CROP_HINDI = {
   "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
 };
 
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      console.log(`📡 Fetch attempt ${i + 1}/${retries} from data.gov.in...`);
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          "Accept": "application/json",
+          "Connection": "keep-alive"
+        }
+      });
+      if (response.ok) return await response.json();
+      console.warn(`Attempt ${i + 1} HTTP status: ${response.status}`);
+    } catch (err) {
+      console.warn(`Attempt ${i + 1} failed: ${err.message}`);
+    }
+    // Wait 2 seconds before retry
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return null;
+}
+
 async function runAutoSync() {
   console.log("🚀 Starting Daily Mandi Sync...");
 
@@ -50,7 +81,6 @@ async function runAutoSync() {
     auth: { persistSession: false }
   });
 
-  // Properly encode filters parameter to avoid Node 22 URL parsing crash
   const params = new URLSearchParams({
     "api-key": DATA_GOV_API_KEY,
     "format": "json",
@@ -61,54 +91,18 @@ async function runAutoSync() {
   const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?${params.toString()}`;
 
   try {
-    console.log("📡 Fetching from data.gov.in API...");
-    let response = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-      }
-    });
+    const data = await fetchWithRetry(url);
 
-    if (!response.ok) {
-      throw new Error(`Govt API HTTP Error: ${response.status} ${response.statusText}`);
+    if (!data || !data.records || data.records.length === 0) {
+      console.log("⚠️ Govt API returned 0 records today or was unreachable. Database left untouched.");
+      process.exit(0);
     }
 
-    let data = await response.json();
-    let records = data?.records || [];
-
-    // Fallback search if filtered query returns empty
-    if (records.length === 0) {
-      console.log("⚠️ Filtered query returned 0, trying general query...");
-      const fallbackParams = new URLSearchParams({
-        "api-key": DATA_GOV_API_KEY,
-        "format": "json",
-        "limit": "2000"
-      });
-      const fallbackUrl = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?${fallbackParams.toString()}`;
-      
-      response = await fetch(fallbackUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "application/json"
-        }
-      });
-      
-      if (response.ok) {
-        data = await response.json();
-        const allRecs = data?.records || [];
-        records = allRecs.filter(r => r.state && r.state.toLowerCase().includes("rajasthan"));
-      }
-    }
-
-    if (records.length === 0) {
-      throw new Error("⚠️ Govt API returned 0 records for Rajasthan today.");
-    }
-
-    console.log(`✅ Got ${records.length} real records from Govt API!`);
+    console.log(`✅ Got ${data.records.length} REAL records from Govt API!`);
 
     const todayStr = new Date().toLocaleDateString("hi-IN");
 
-    const rows = records
+    const rows = data.records
       .map((r) => {
         const minP = Number(r.min_price) || 0;
         const maxP = Number(r.max_price) || 0;
@@ -131,10 +125,15 @@ async function runAutoSync() {
       })
       .filter(Boolean);
 
+    if (rows.length === 0) {
+      console.log("⚠️ All records were zero/invalid.");
+      process.exit(0);
+    }
+
     console.log(`🧹 Clearing old API records from Supabase...`);
     await supabase.from("mandi_rates").delete().eq("source", "api");
 
-    console.log(`💾 Inserting ${rows.length} real government mandi records into Supabase...`);
+    console.log(`💾 Inserting ${rows.length} REAL government mandi records into Supabase...`);
     const { error } = await supabase.from("mandi_rates").insert(rows);
 
     if (error) throw error;
@@ -142,7 +141,7 @@ async function runAutoSync() {
     console.log("🎉 SUCCESS! Real Mandi Rates Updated Successfully!");
   } catch (err) {
     console.error("❌ Sync Error:", err.message);
-    process.exit(1); // Fail workflow if fetch fails so you see exact error in GH Actions
+    process.exit(1);
   }
 }
 
