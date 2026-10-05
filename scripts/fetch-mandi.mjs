@@ -60,13 +60,24 @@ function sleep(ms) {
 
 async function fetchJsonWithRetry(url, tries = 6) {
   let lastErr = null;
+
   for (let i = 0; i < tries; i++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
     try {
-      const res = await fetch(url, { redirect: "follow" });
+      const res = await fetch(url, {
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (GitHub Actions; Node fetch)",
+          "Accept": "application/json"
+        }
+      });
+
       const text = await res.text();
 
       if (!res.ok) {
-        // server busy / throttling
         if ([429, 500, 502, 503, 504].includes(res.status)) {
           await sleep(Math.min(60000, 1000 * 2 ** i));
           continue;
@@ -74,13 +85,20 @@ async function fetchJsonWithRetry(url, tries = 6) {
         throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
       }
 
-      const json = JSON.parse(text);
-      return json;
+      return JSON.parse(text);
     } catch (e) {
       lastErr = e;
+
+      // yahi se real reason dikhega: ENOTFOUND / ECONNRESET / ETIMEDOUT etc.
+      console.log("Fetch error:", e?.message);
+      if (e?.cause) console.log("Cause:", e.cause);
+
       await sleep(Math.min(60000, 1000 * 2 ** i));
+    } finally {
+      clearTimeout(t);
     }
   }
+
   throw lastErr ?? new Error("Unknown fetch error");
 }
 
