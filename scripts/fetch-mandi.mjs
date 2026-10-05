@@ -1,12 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 import dns from "node:dns";
 
-// 1. Force Node.js to use IPv4 first (fixes fetch failed on GitHub Actions for govt sites)
 if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
-
-// 2. Allow Govt SSL Certificates
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MANDI_HINDI = {
@@ -43,28 +40,6 @@ const CROP_HINDI = {
   "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
 };
 
-async function fetchWithRetry(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`📡 Fetch attempt ${i + 1}/${retries} from data.gov.in...`);
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-          "Accept": "application/json",
-          "Connection": "keep-alive"
-        }
-      });
-      if (response.ok) return await response.json();
-      console.warn(`Attempt ${i + 1} HTTP status: ${response.status}`);
-    } catch (err) {
-      console.warn(`Attempt ${i + 1} failed: ${err.message}`);
-    }
-    // Wait 2 seconds before retry
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  return null;
-}
-
 async function runAutoSync() {
   console.log("🚀 Starting Daily Mandi Sync...");
 
@@ -73,7 +48,7 @@ async function runAutoSync() {
   const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DATA_GOV_API_KEY) {
-    console.error("❌ Secrets Missing in Environment!");
+    console.error("❌ Secrets Missing in GitHub Environment!");
     process.exit(1);
   }
 
@@ -81,68 +56,90 @@ async function runAutoSync() {
     auth: { persistSession: false }
   });
 
-  const params = new URLSearchParams({
-    "api-key": DATA_GOV_API_KEY,
-    "format": "json",
-    "limit": "2000",
-    "filters[state]": "Rajasthan"
+  // Fetch full records limit without filters parameter string issue
+  const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${DATA_GOV_API_KEY}&format=json&limit=3000`;
+
+  console.log("📡 Requesting raw records from Govt API...");
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Accept": "application/json"
+    }
   });
 
-  const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?${params.toString()}`;
-
-  try {
-    const data = await fetchWithRetry(url);
-
-    if (!data || !data.records || data.records.length === 0) {
-      console.log("⚠️ Govt API returned 0 records today or was unreachable. Database left untouched.");
-      process.exit(0);
-    }
-
-    console.log(`✅ Got ${data.records.length} REAL records from Govt API!`);
-
-    const todayStr = new Date().toLocaleDateString("hi-IN");
-
-    const rows = data.records
-      .map((r) => {
-        const minP = Number(r.min_price) || 0;
-        const maxP = Number(r.max_price) || 0;
-        const modalP = Number(r.modal_price) || 0;
-        if (minP === 0 && maxP === 0 && modalP === 0) return null;
-
-        return {
-          mandi_name: MANDI_HINDI[r.market] || r.market || "अज्ञात",
-          district: DISTRICT_HINDI[r.district] || r.district || "राजस्थान",
-          state: "Rajasthan",
-          crop_name: CROP_HINDI[r.commodity] || r.commodity || "फसल",
-          variety: (r.variety || "").trim(),
-          min_price: minP,
-          max_price: maxP,
-          modal_price: modalP,
-          arrival_date: r.arrival_date || todayStr,
-          source: "api",
-          updated_at: new Date().toISOString(),
-        };
-      })
-      .filter(Boolean);
-
-    if (rows.length === 0) {
-      console.log("⚠️ All records were zero/invalid.");
-      process.exit(0);
-    }
-
-    console.log(`🧹 Clearing old API records from Supabase...`);
-    await supabase.from("mandi_rates").delete().eq("source", "api");
-
-    console.log(`💾 Inserting ${rows.length} REAL government mandi records into Supabase...`);
-    const { error } = await supabase.from("mandi_rates").insert(rows);
-
-    if (error) throw error;
-
-    console.log("🎉 SUCCESS! Real Mandi Rates Updated Successfully!");
-  } catch (err) {
-    console.error("❌ Sync Error:", err.message);
+  if (!res.ok) {
+    console.error(`❌ Govt API Returned HTTP Error Status: ${res.status} ${res.statusText}`);
     process.exit(1);
   }
+
+  const data = await res.json();
+  const allRecords = data?.records || [];
+
+  console.log(`📦 Received ${allRecords.length} total records from Govt API.`);
+
+  if (allRecords.length === 0) {
+    console.error("❌ Govt API returned 0 total records today. API server might be down.");
+    process.exit(1);
+  }
+
+  // Filter Rajasthan records in memory safely
+  const rajRecords = allRecords.filter((r) => {
+    const st = String(r.state || r.State || r.state_name || "").toLowerCase();
+    return st.includes("rajasthan") || st.includes("raj");
+  });
+
+  console.log(`🌾 Found ${rajRecords.length} records specifically for Rajasthan.`);
+
+  // If specific state field filter is empty, process all valid returned records
+  const targetRecords = rajRecords.length > 0 ? rajRecords : allRecords;
+
+  const todayStr = new Date().toLocaleDateString("hi-IN");
+
+  const rows = targetRecords
+    .map((r) => {
+      const minP = Number(r.min_price) || 0;
+      const maxP = Number(r.max_price) || 0;
+      const modalP = Number(r.modal_price) || 0;
+      if (minP === 0 && maxP === 0 && modalP === 0) return null;
+
+      const marketRaw = String(r.market || "");
+      const districtRaw = String(r.district || "");
+      const cropRaw = String(r.commodity || "");
+
+      return {
+        mandi_name: MANDI_HINDI[marketRaw] || marketRaw || "अज्ञात",
+        district: DISTRICT_HINDI[districtRaw] || districtRaw || "राजस्थान",
+        state: "Rajasthan",
+        crop_name: CROP_HINDI[cropRaw] || cropRaw || "फसल",
+        variety: String(r.variety || "").trim(),
+        min_price: minP,
+        max_price: maxP,
+        modal_price: modalP,
+        arrival_date: String(r.arrival_date || todayStr),
+        source: "api",
+        updated_at: new Date().toISOString(),
+      };
+    })
+    .filter(Boolean);
+
+  if (rows.length === 0) {
+    console.error("❌ 0 valid price rows found after parsing.");
+    process.exit(1);
+  }
+
+  console.log(`🧹 Clearing old API records from Supabase...`);
+  const { error: delError } = await supabase.from("mandi_rates").delete().eq("source", "api");
+  if (delError) console.warn("Delete warning:", delError.message);
+
+  console.log(`💾 Inserting ${rows.length} real Govt Mandi records into Supabase...`);
+  const { error: insError } = await supabase.from("mandi_rates").insert(rows);
+
+  if (insError) {
+    console.error("❌ Supabase DB Insert Failed:", insError.message);
+    process.exit(1);
+  }
+
+  console.log(`🎉 SUCCESS! Successfully inserted ${rows.length} Mandi Rates into Supabase!`);
 }
 
 runAutoSync();
