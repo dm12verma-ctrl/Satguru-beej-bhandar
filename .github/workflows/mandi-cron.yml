@@ -21,7 +21,14 @@ jobs:
 
       - name: Install Dependencies
         run: npm install @supabase/supabase-js
-
+      - name: Ping data.gov.in API (debug)
+        env:
+          DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
+          DATA_GOV_RESOURCE_ID: ${{ secrets.DATA_GOV_RESOURCE_ID }}
+        run: |
+          url="https://api.data.gov.in/resource/$DATA_GOV_RESOURCE_ID?api-key=$DATA_GOV_API_KEY&format=json&limit=1"
+          echo "Hitting data.gov.in (status only)..."
+          curl -s -o /dev/null -w "HTTP=%{http_code}\n" "$url"
       - name: Run Fetch Script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
