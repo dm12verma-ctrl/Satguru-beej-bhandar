@@ -1,10 +1,4 @@
 import { createClient } from "@supabase/supabase-js";
-import dns from "node:dns";
-
-if (dns.setDefaultResultOrder) {
-  dns.setDefaultResultOrder("ipv4first");
-}
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
@@ -46,158 +40,180 @@ const TARGET_CROPS = [
   { en: "Paddy", hi: "धान" }
 ];
 
-// Full Browser ASP.NET Headers to bypass HTTP 403 Forbidden
-const BROWSER_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-  "Referer": "https://agmarknet.gov.in/",
-  "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "cross-site",
-  "Upgrade-Insecure-Requests": "1"
-};
+function istDateISO(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(d); // YYYY-MM-DD
+}
 
-async function fetchCropRss(cropEn) {
-  const targetUrl = `https://agmarknet.gov.in/RssFeed/RssFeed_Commoditywise.aspx?com=${encodeURIComponent(cropEn)}`;
-  
-  // 1. Direct fetch with Browser Headers
-  try {
-    const res = await fetch(targetUrl, { headers: BROWSER_HEADERS });
-    if (res.ok) {
-      const xml = await res.text();
-      if (xml && xml.includes("<item>")) return xml;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchJsonWithRetry(url, tries = 6) {
+  let lastErr = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, { redirect: "follow" });
+      const text = await res.text();
+
+      if (!res.ok) {
+        // server busy / throttling
+        if ([429, 500, 502, 503, 504].includes(res.status)) {
+          await sleep(Math.min(60000, 1000 * 2 ** i));
+          continue;
+        }
+        throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+      }
+
+      const json = JSON.parse(text);
+      return json;
+    } catch (e) {
+      lastErr = e;
+      await sleep(Math.min(60000, 1000 * 2 ** i));
     }
-  } catch (e) {}
+  }
+  throw lastErr ?? new Error("Unknown fetch error");
+}
 
-  // 2. AllOrigins Proxy
-  try {
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-    const res = await fetch(proxyUrl);
-    if (res.ok) {
-      const xml = await res.text();
-      if (xml && xml.includes("<item>")) return xml;
-    }
-  } catch (e) {}
+// Normalize some common arrival_date formats to YYYY-MM-DD if needed
+function normalizeDateToISO(s) {
+  if (!s) return "";
+  // already ISO
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // dd/mm/yyyy
+  const m = String(s).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const dd = m[1].padStart(2, "0");
+    const mm = m[2].padStart(2, "0");
+    const yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return String(s);
+}
 
-  // 3. ThingProxy
-  try {
-    const proxyUrl = `https://thingproxy.freeboard.io/fetch/${targetUrl}`;
-    const res = await fetch(proxyUrl);
-    if (res.ok) {
-      const xml = await res.text();
-      if (xml && xml.includes("<item>")) return xml;
-    }
-  } catch (e) {}
+async function fetchDataGovPage({ baseUrl, apiKey, state, commodity, arrival_date, limit, offset }) {
+  const u = new URL(baseUrl);
+  u.searchParams.set("api-key", apiKey);
+  u.searchParams.set("format", "json");
+  u.searchParams.set("limit", String(limit));
+  u.searchParams.set("offset", String(offset));
 
-  return null;
+  // filters (field names usually exactly these for agmarknet datasets)
+  u.searchParams.set("filters[state]", state);
+  u.searchParams.set("filters[commodity]", commodity);
+  u.searchParams.set("filters[arrival_date]", arrival_date);
+
+  return fetchJsonWithRetry(u.toString(), 6);
 }
 
 async function runAutoSync() {
-  console.log("🚀 Starting Daily Agmarknet Mandi Sync...");
+  console.log("🚀 Starting Daily Govt Mandi Sync (data.gov.in) ...");
 
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
+  const DATA_GOV_RESOURCE_ID = process.env.DATA_GOV_RESOURCE_ID;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    console.error("❌ Supabase Secrets Missing in Environment!");
-    process.exit(0);
+    throw new Error("Supabase secrets missing: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
+  }
+  if (!DATA_GOV_API_KEY || !DATA_GOV_RESOURCE_ID) {
+    throw new Error("Missing: DATA_GOV_API_KEY or DATA_GOV_RESOURCE_ID (add in GitHub Secrets)");
   }
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false }
   });
 
+  const todayISO = istDateISO();
+  const baseUrl = `https://api.data.gov.in/resource/${DATA_GOV_RESOURCE_ID}`;
   const allRows = [];
-  const todayStr = new Date().toLocaleDateString("hi-IN");
 
   for (const crop of TARGET_CROPS) {
-    console.log(`📡 Fetching Agmarknet Feed for: ${crop.hi} (${crop.en})...`);
-    const xmlText = await fetchCropRss(crop.en);
+    console.log(`📡 Fetching data.gov.in for: ${crop.hi} (${crop.en}) | date=${todayISO}`);
+    const limit = 200;
+    let offset = 0;
+    let gotAny = false;
 
-    if (!xmlText) {
-      console.warn(`⚠️ Could not fetch RSS feed for ${crop.en}`);
-      continue;
-    }
+    while (true) {
+      const json = await fetchDataGovPage({
+        baseUrl,
+        apiKey: DATA_GOV_API_KEY,
+        state: "Rajasthan",
+        commodity: crop.en,
+        arrival_date: todayISO,
+        limit,
+        offset
+      });
 
-    const items = xmlText.match(/<item>[\s\S]*?<\/item>/gi) || [];
+      const records = json?.records || [];
+      if (records.length === 0) break;
 
-    for (const itemXml of items) {
-      if (!itemXml.toLowerCase().includes("rajasthan")) continue;
+      gotAny = true;
 
-      const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/i);
-      const descMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/i);
-      const dateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+      for (const r of records) {
+        const marketRaw = r.market || r.Market || "";
+        const districtRaw = r.district || r.District || "";
+        const varietyRaw = r.variety || r.Variety || "";
 
-      const text = (titleMatch ? titleMatch[1] : "") + " " + (descMatch ? descMatch[1] : "");
+        const minP = Number(r.min_price ?? r.Min_Price ?? r.minimum_price ?? 0) || 0;
+        const maxP = Number(r.max_price ?? r.Max_Price ?? r.maximum_price ?? 0) || 0;
+        const modalP = Number(r.modal_price ?? r.Modal_Price ?? r.modal ?? 0) || (maxP || minP);
 
-      const mktMatch = text.match(/Market:\s*([^,<\n]+)/i);
-      const mktRaw = mktMatch ? mktMatch[1].trim() : "";
-      if (!mktRaw) continue;
+        if (!marketRaw) continue;
+        if (minP === 0 && maxP === 0 && modalP === 0) continue;
 
-      const distMatch = text.match(/District:\s*([^,<\n]+)/i);
-      const distRaw = distMatch ? distMatch[1].trim() : "";
+        const arrival = normalizeDateToISO(r.arrival_date || r.Arrival_Date || todayISO);
 
-      const varMatch = text.match(/Variety:\s*([^,<\n]+)/i);
-      const varietyRaw = varMatch ? varMatch[1].trim() : "";
-
-      const minMatch = text.match(/Min:\s*(\d+)/i) || text.match(/Minimum:\s*(\d+)/i);
-      const maxMatch = text.match(/Max:\s*(\d+)/i) || text.match(/Maximum:\s*(\d+)/i);
-      const modalMatch = text.match(/Modal:\s*(\d+)/i);
-
-      const minP = minMatch ? Number(minMatch[1]) : 0;
-      const maxP = maxMatch ? Number(maxMatch[1]) : 0;
-      const modalP = modalMatch ? Number(modalMatch[1]) : (maxP || minP);
-
-      if (minP === 0 && maxP === 0 && modalP === 0) continue;
-
-      const marketHi = MANDI_HINDI[mktRaw] || mktRaw;
-      const districtHi = DISTRICT_HINDI[distRaw] || distRaw || "राजस्थान";
-
-      let dateStr = todayStr;
-      if (dateMatch && dateMatch[1]) {
-        const parsed = new Date(dateMatch[1]);
-        if (!isNaN(parsed.getTime())) {
-          dateStr = parsed.toLocaleDateString("hi-IN");
-        }
+        allRows.push({
+          mandi_name: MANDI_HINDI[marketRaw] || marketRaw,
+          district: DISTRICT_HINDI[districtRaw] || districtRaw || "राजस्थान",
+          state: "Rajasthan",
+          crop_name: crop.hi,
+          variety: (varietyRaw && varietyRaw !== "Local" && varietyRaw !== "Other") ? varietyRaw : "",
+          min_price: minP,
+          max_price: maxP,
+          modal_price: modalP,
+          arrival_date: arrival,
+          source: "api",
+          updated_at: new Date().toISOString()
+        });
       }
 
-      allRows.push({
-        mandi_name: marketHi,
-        district: districtHi,
-        state: "Rajasthan",
-        crop_name: crop.hi,
-        variety: varietyRaw !== "Local" && varietyRaw !== "Other" ? varietyRaw : "",
-        min_price: minP,
-        max_price: maxP,
-        modal_price: modalP,
-        arrival_date: dateStr,
-        source: "api",
-        updated_at: new Date().toISOString()
-      });
+      offset += limit;
+
+      // safety stop to avoid infinite loops
+      if (offset > 5000) break;
     }
+
+    if (!gotAny) console.log(`⚠️ No records for ${crop.en} on ${todayISO}`);
   }
 
-  console.log(`📦 Extracted ${allRows.length} REAL Govt Mandi Records!`);
+  console.log(`📦 Extracted ${allRows.length} Govt Mandi Records!`);
+  if (allRows.length === 0) {
+    console.log("⚠️ No records fetched. Keeping existing DB intact.");
+    return;
+  }
 
-  if (allRows.length > 0) {
-    console.log(`🧹 Clearing old API records from Supabase...`);
-    await supabase.from("mandi_rates").delete().eq("source", "api");
+  // Safer approach: delete only after we have fresh data
+  console.log("🧹 Clearing old API records from Supabase...");
+  const delRes = await supabase.from("mandi_rates").delete().eq("source", "api");
+  if (delRes.error) console.error("Delete error:", delRes.error);
 
-    console.log(`💾 Inserting ${allRows.length} fresh records into Supabase...`);
-    const { error: insErr } = await supabase.from("mandi_rates").insert(allRows);
-
-    if (insErr) {
-      console.error("❌ Supabase Insert Error:", insErr.message);
-    } else {
-      console.log(`🎉 SUCCESS! Fully Synced ${allRows.length} Live Mandi Rates!`);
-    }
+  console.log(`💾 Inserting ${allRows.length} records...`);
+  const insRes = await supabase.from("mandi_rates").insert(allRows);
+  if (insRes.error) {
+    console.error("❌ Insert error:", insRes.error);
   } else {
-    console.log("⚠️ Govt RSS returned 0 records today. Keeping existing Database intact.");
+    console.log("🎉 SUCCESS! Sync completed.");
   }
 }
 
-runAutoSync();
+runAutoSync().catch((e) => {
+  console.error("❌ Fatal:", e?.message || e);
+  process.exit(1);
+});
