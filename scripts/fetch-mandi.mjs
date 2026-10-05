@@ -1,10 +1,4 @@
 import { createClient } from "@supabase/supabase-js";
-import dns from "node:dns";
-
-if (dns.setDefaultResultOrder) {
-  dns.setDefaultResultOrder("ipv4first");
-}
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MANDI_HINDI = {
   "Sardarshahar": "सरदारशहर", "Nohar": "नोहर", "Rawatsar": "रावतसर", "Hanumangarh": "हनुमानगढ़",
@@ -40,6 +34,35 @@ const CROP_HINDI = {
   "Garlic": "लहसुन", "Onion": "प्याज़", "Till(Sesamum)": "तिल"
 };
 
+async function fetchGovtDataViaProxy(apiKey) {
+  const targetUrl = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${apiKey}&format=json&limit=2000`;
+  
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
+  ];
+
+  for (const proxyUrl of proxies) {
+    try {
+      const hostname = new URL(proxyUrl).hostname;
+      console.log(`📡 Requesting Govt API via Proxy: ${hostname}...`);
+      const res = await fetch(proxyUrl, { headers: { "Accept": "application/json" } });
+      if (res.ok) {
+        const data = await res.json();
+        const records = data?.records || (typeof data === "string" ? JSON.parse(data)?.records : null);
+        if (records && records.length > 0) {
+          console.log(`✅ Successfully fetched ${records.length} records via ${hostname}!`);
+          return records;
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠️ Proxy failed: ${err.message}`);
+    }
+  }
+  return null;
+}
+
 async function runAutoSync() {
   console.log("🚀 Starting Daily Mandi Sync...");
 
@@ -48,7 +71,7 @@ async function runAutoSync() {
   const DATA_GOV_API_KEY = process.env.DATA_GOV_API_KEY;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DATA_GOV_API_KEY) {
-    console.error("❌ Secrets Missing in GitHub Environment!");
+    console.error("❌ Secrets Missing in Environment!");
     process.exit(1);
   }
 
@@ -56,43 +79,20 @@ async function runAutoSync() {
     auth: { persistSession: false }
   });
 
-  // Fetch full records limit without filters parameter string issue
-  const url = `https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key=${DATA_GOV_API_KEY}&format=json&limit=3000`;
+  const rawRecords = await fetchGovtDataViaProxy(DATA_GOV_API_KEY);
 
-  console.log("📡 Requesting raw records from Govt API...");
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "Accept": "application/json"
-    }
-  });
-
-  if (!res.ok) {
-    console.error(`❌ Govt API Returned HTTP Error Status: ${res.status} ${res.statusText}`);
+  if (!rawRecords || rawRecords.length === 0) {
+    console.error("❌ All proxies and direct connections failed / Govt API is offline.");
     process.exit(1);
   }
 
-  const data = await res.json();
-  const allRecords = data?.records || [];
-
-  console.log(`📦 Received ${allRecords.length} total records from Govt API.`);
-
-  if (allRecords.length === 0) {
-    console.error("❌ Govt API returned 0 total records today. API server might be down.");
-    process.exit(1);
-  }
-
-  // Filter Rajasthan records in memory safely
-  const rajRecords = allRecords.filter((r) => {
+  // Filter Rajasthan
+  const rajRecords = rawRecords.filter((r) => {
     const st = String(r.state || r.State || r.state_name || "").toLowerCase();
     return st.includes("rajasthan") || st.includes("raj");
   });
 
-  console.log(`🌾 Found ${rajRecords.length} records specifically for Rajasthan.`);
-
-  // If specific state field filter is empty, process all valid returned records
-  const targetRecords = rajRecords.length > 0 ? rajRecords : allRecords;
-
+  const targetRecords = rajRecords.length > 0 ? rajRecords : rawRecords;
   const todayStr = new Date().toLocaleDateString("hi-IN");
 
   const rows = targetRecords
@@ -123,19 +123,18 @@ async function runAutoSync() {
     .filter(Boolean);
 
   if (rows.length === 0) {
-    console.error("❌ 0 valid price rows found after parsing.");
+    console.error("❌ 0 valid price rows after parsing.");
     process.exit(1);
   }
 
   console.log(`🧹 Clearing old API records from Supabase...`);
-  const { error: delError } = await supabase.from("mandi_rates").delete().eq("source", "api");
-  if (delError) console.warn("Delete warning:", delError.message);
+  await supabase.from("mandi_rates").delete().eq("source", "api");
 
-  console.log(`💾 Inserting ${rows.length} real Govt Mandi records into Supabase...`);
-  const { error: insError } = await supabase.from("mandi_rates").insert(rows);
+  console.log(`💾 Inserting ${rows.length} REAL government mandi records into Supabase...`);
+  const { error } = await supabase.from("mandi_rates").insert(rows);
 
-  if (insError) {
-    console.error("❌ Supabase DB Insert Failed:", insError.message);
+  if (error) {
+    console.error("❌ Supabase DB Insert Failed:", error.message);
     process.exit(1);
   }
 
